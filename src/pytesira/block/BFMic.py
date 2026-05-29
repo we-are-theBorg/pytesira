@@ -31,6 +31,14 @@ _DEFAULT_RATE_MS = 300
 ACTIVE_THRESHOLD = 0.5
 
 
+def _safe_float(val, default: float = 0.0) -> float:
+    """Convert val to float, stripping any trailing TTP dict braces."""
+    try:
+        return float(str(val).strip().rstrip('}').strip())
+    except (ValueError, TypeError):
+        return default
+
+
 class BFMic(Block):
     """
     Biamp Parlé Beamforming Microphone — TTP block type 'BFMic'.
@@ -42,7 +50,7 @@ class BFMic(Block):
     - Per-beam elevation from lobeData query (FW 4.11.2+)
     """
 
-    VERSION = "0.1.0"
+    VERSION = "0.1.1"
 
     def __init__(
         self,
@@ -67,11 +75,10 @@ class BFMic(Block):
         )
 
         # Beam tracking data — updated by audioSources subscription
-        self.beams: list[dict] = []         # [{azimuth: float, intensity: float}, ...]
-        self.segments_active: list = []     # list of bools from segmentsActive
-        self.elevations: list[float] = []   # per-beam elevation (FW 4.11.2+)
+        self.beams: list[dict] = []
+        self.segments_active: list = []
+        self.elevations: list[float] = []
 
-        # Load attributes (channels, level/mute ranges)
         try:
             if init_helper is not None:
                 self._load_init_helper(init_helper)
@@ -81,10 +88,8 @@ class BFMic(Block):
             self._logger.debug(f"loading from init helper failed: {e}, querying DSP")
             self._query_attributes()
 
-        # One-time elevation query (silently skipped on older firmware)
         self._query_lobe_data()
 
-        # Build init helper for block map caching
         self._init_helper = {"channels": {}}
         for idx, ch in self.channels.items():
             self._init_helper["channels"][int(idx)] = ch.schema
@@ -94,15 +99,10 @@ class BFMic(Block):
     # ------------------------------------------------------------------
 
     def subscribe(self) -> None:
-        """Called once by the DSP after __init__ to register TTP subscriptions."""
         self._subscribe_mute_level()
         self._subscribe_beamtracking()
 
     def _register_base_subscriptions(self) -> list[TTPResponse]:
-        """
-        Called by the DSP device-data refresh loop on reconnect.
-        Returns list of TTPResponse for reconnect-detection logic.
-        """
         results = []
         results += self._subscribe_mute_level()
         results += self._subscribe_beamtracking()
@@ -115,17 +115,10 @@ class BFMic(Block):
                 r = self._register_subscription(subscribe_type=sub_type, channel=None)
                 results.append(r)
             except Exception as exc:
-                self._logger.warning(f"{sub_type} subscription failed: {exc}")
+                self._logger.debug(f"{sub_type} subscribe timed out (normal): {exc}")
         return results
 
     def _subscribe_beamtracking(self) -> list[TTPResponse]:
-        """
-        Subscribe to audioSources and segmentsActive.
-
-        BFMic sends the first subscription notification before +OK, causing
-        _sync_command to time out. We add to routing BEFORE sending, catch
-        the timeout, and continue — data will flow correctly regardless.
-        """
         results = []
         for sub_type in ("audioSources", "segmentsActive"):
             try:
@@ -136,68 +129,66 @@ class BFMic(Block):
                 )
                 results.append(r)
             except Exception as exc:
-                # Timeout is expected — subscription is active even if +OK didn't arrive
                 self._logger.debug(
-                    f"{sub_type} subscribe command timed out (normal for BFMic): {exc}"
+                    f"{sub_type} subscribe timed out (normal for BFMic): {exc}"
                 )
         return results
 
     # ------------------------------------------------------------------
-    # Subscription callback
+    # Subscription callback — wrapped in try/except to protect rx_loop
     # ------------------------------------------------------------------
 
     def subscription_callback(self, response: TTPResponse) -> None:
-        sub_type = response.subscription_type
+        try:
+            sub_type = response.subscription_type
 
-        if sub_type == "mutes":
-            items = response.value if isinstance(response.value, list) else [response.value]
-            for i, mute in enumerate(items):
-                idx = i + 1
-                if idx in self.channels:
-                    self.channels[idx]._muted(bool(mute))
-            self._logger.debug(f"mutes: {response.value}")
+            if sub_type == "mutes":
+                items = response.value if isinstance(response.value, list) else [response.value]
+                for i, mute in enumerate(items):
+                    idx = i + 1
+                    if idx in self.channels:
+                        self.channels[idx]._muted(bool(mute))
 
-        elif sub_type == "levels":
-            items = response.value if isinstance(response.value, list) else [response.value]
-            for i, level in enumerate(items):
-                idx = i + 1
-                if idx in self.channels:
-                    self.channels[idx]._level(float(level))
-            self._logger.debug(f"levels: {response.value}")
+            elif sub_type == "levels":
+                items = response.value if isinstance(response.value, list) else [response.value]
+                for i, level in enumerate(items):
+                    idx = i + 1
+                    if idx in self.channels:
+                        self.channels[idx]._level(_safe_float(level))
 
-        elif sub_type == "audioSources":
-            self._handle_audio_sources(response.value)
+            elif sub_type == "audioSources":
+                self._handle_audio_sources(response.value)
 
-        elif sub_type == "segmentsActive":
-            val = response.value
-            self.segments_active = val if isinstance(val, list) else [val]
-            self._logger.debug(f"segmentsActive: {self.segments_active}")
+            elif sub_type == "segmentsActive":
+                val = response.value
+                self.segments_active = val if isinstance(val, list) else [val]
 
-        else:
-            self._logger.debug(f"unhandled subscription: {sub_type}")
+        except Exception as exc:
+            self._logger.warning(f"subscription_callback error ({response.subscription_type}): {exc}")
 
         super().subscription_callback(response)
 
     def _handle_audio_sources(self, value) -> None:
         items = value if isinstance(value, list) else [value]
-        self.beams = [
-            {
-                "azimuth": float(item.get("azimuth", 0)),
-                "intensity": float(item.get("intensity", 0)),
-            }
-            for item in items
-            if isinstance(item, dict)
-        ]
-        self._logger.debug(f"beams: {len(self.beams)} ({self.talker_count} active)")
+        beams = []
+        for item in items:
+            try:
+                if isinstance(item, dict):
+                    beams.append({
+                        "azimuth":   _safe_float(item.get("azimuth", 0)),
+                        "intensity": _safe_float(item.get("intensity", 0)),
+                    })
+            except Exception as exc:
+                self._logger.debug(f"beam parse error: {exc!r} item={item!r}")
+        self.beams = beams
 
     # ------------------------------------------------------------------
-    # Channel change callbacks (from Channel.muted / Channel.level setters)
+    # Channel change callbacks
     # ------------------------------------------------------------------
 
     def _channel_change_callback(
         self, data_type: str, channel_index: int, new_value
     ) -> TTPResponse | None:
-        from pytesira.util.types import TTPResponseType
         if data_type == "muted":
             cmd_res = self._sync_command(
                 f'"{self._block_id}" set mute {channel_index} {str(new_value).lower()}'
@@ -222,7 +213,7 @@ class BFMic(Block):
 
     def _query_attributes(self) -> None:
         num_channels = int(
-            self._sync_command(f"{self._block_id} get numChannels").value
+            self._sync_command(f'"{self._block_id}" get numChannels').value
         )
         self.channels = {}
         for i in range(1, num_channels + 1):
@@ -233,16 +224,16 @@ class BFMic(Block):
                 {
                     "label": f"{self._block_id}_ch{i}",
                     "min_level": self._sync_command(
-                        f"{self._block_id} get minLevel {i}"
+                        f'"{self._block_id}" get minLevel {i}'
                     ).value,
                     "max_level": self._sync_command(
-                        f"{self._block_id} get maxLevel {i}"
+                        f'"{self._block_id}" get maxLevel {i}'
                     ).value,
                     "muted": self._sync_command(
-                        f"{self._block_id} get mute {i}"
+                        f'"{self._block_id}" get mute {i}'
                     ).value,
                     "level": self._sync_command(
-                        f"{self._block_id} get level {i}"
+                        f'"{self._block_id}" get level {i}'
                     ).value,
                 },
             )
@@ -259,7 +250,7 @@ class BFMic(Block):
             resp = self._sync_command(f'"{self._block_id}" get lobeData')
             if resp.type == TTPResponseType.CMD_OK_VALUE and isinstance(resp.value, list):
                 self.elevations = [
-                    float(item.get("elevation", 0)) if isinstance(item, dict) else 0.0
+                    _safe_float(item.get("elevation", 0)) if isinstance(item, dict) else 0.0
                     for item in resp.value
                 ]
         except Exception:
