@@ -355,6 +355,38 @@ class DSP:
         """
         return self.device_command("DEVICE reboot")
 
+    def recall_preset(self, preset_id: int) -> bool:
+        """
+        Recall a preset by numeric ID.
+
+        TTP: DEVICE recallPreset <id>
+        Returns True on success, False on DSP error.
+        Preset IDs are assigned in the Tesira design file.
+        """
+        resp = self.device_command(f"DEVICE recallPreset {int(preset_id)}")
+        ok = resp.type == TTPResponseType.CMD_OK
+        if ok:
+            self.__logger.info(f"preset {preset_id} recalled")
+        else:
+            self.__logger.warning(f"preset {preset_id} recall failed: {resp.value}")
+        return ok
+
+    def recall_preset_by_name(self, name: str) -> bool:
+        """
+        Recall a preset by name.
+
+        TTP: DEVICE recallPresetByName "<name>"
+        Returns True on success, False if the preset name does not exist on the device.
+        Preset names are defined in the Tesira design file and cannot be queried via TTP.
+        """
+        resp = self.device_command(f'DEVICE recallPresetByName "{name}"')
+        ok = resp.type == TTPResponseType.CMD_OK
+        if ok:
+            self.__logger.info(f"preset '{name}' recalled")
+        else:
+            self.__logger.warning(f"preset '{name}' recall failed: {resp.value}")
+        return ok
+
     # =================================================================================================================
 
     def __getDSPBlockMap(self) -> dict:
