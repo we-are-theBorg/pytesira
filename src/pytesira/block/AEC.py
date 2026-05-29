@@ -137,23 +137,31 @@ class AEC(BaseLevelMute):
     # ------------------------------------------------------------------
 
     def subscribe(self) -> None:
-        """Called by DSP after __init__ to set up meters subscriptions per channel."""
+        """Called by DSP after __init__ to set up meters subscriptions per channel.
+
+        Uses a 2-second rate to limit the volume of AEC telemetry push data.
+        The meters subscription is set up once on initial connect only — it is
+        intentionally NOT renewed in _register_base_subscriptions() to avoid
+        flooding the serial TTP command queue during the periodic refresh cycle.
+        """
         for ch in self.channels:
             try:
-                self._register_subscription(subscribe_type="meters", channel=ch)
+                self._register_subscription(
+                    subscribe_type="meters", channel=ch, rate_ms=2000
+                )
             except Exception as exc:
-                self._logger.warning(f"meters subscribe ch{ch} failed: {exc}")
+                self._logger.debug(f"meters subscribe ch{ch} timed out (normal): {exc}")
 
     def _register_base_subscriptions(self) -> list[TTPResponse]:
-        """Re-subscribe on reconnect: standard mute/level plus meters."""
-        results = super()._register_base_subscriptions()
-        for ch in self.channels:
-            try:
-                r = self._register_subscription(subscribe_type="meters", channel=ch)
-                results.append(r)
-            except Exception as exc:
-                self._logger.warning(f"meters re-subscribe ch{ch} failed: {exc}")
-        return results
+        """Re-subscribe on reconnect: standard mute/level only.
+
+        AEC meters subscriptions are deliberately excluded here. Re-subscribing
+        8 channels × N AEC blocks every 30 seconds serialises hundreds of TTP
+        commands and saturates the SSH channel, causing timeout cascades on
+        other blocks. Meters data will resume naturally when the DSP reconnects
+        and subscribe() is called again by the DSP init sequence.
+        """
+        return super()._register_base_subscriptions()
 
     # ------------------------------------------------------------------
     # Subscription callback
