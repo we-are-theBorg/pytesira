@@ -21,7 +21,7 @@ from pytesira.util.types import TTPResponseType
 import logging
 
 # Default subscription rate (ms).  Lower = more responsive but more SSH traffic.
-_DEFAULT_RATE_MS = 300
+_DEFAULT_RATE_MS = 500
 
 # Beams at or above this intensity are considered active talkers.
 ACTIVE_THRESHOLD = 0.5

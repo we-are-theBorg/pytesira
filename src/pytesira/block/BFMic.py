@@ -27,7 +27,7 @@ from pytesira.util.types import TTPResponseType
 from pytesira.util.channel import Channel
 import logging
 
-_DEFAULT_RATE_MS = 300
+_DEFAULT_RATE_MS = 500
 ACTIVE_THRESHOLD = 0.5
 
 
