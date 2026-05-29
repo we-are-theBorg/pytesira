@@ -16,14 +16,14 @@ class Block:
 
     def __init__(
         self,
-        block_id: str,  # block ID on Tesira
-        exit_flag: Event,  # exit flag to stop the block's threads (sync'd with everything else)
+        block_id: str,          # block ID on Tesira
+        exit_flag: Event,       # exit flag to stop the block's threads (sync'd with everything else)
         connected_flag: Event,  # connected flag (module can refuse to allow access if this is not set)
-        command_queue: Queue,  # command queue (to run synchronous commands and get results)
-        subscriptions: dict,  # subscription container on main thread
+        command_queue: Queue,   # command queue (to run synchronous commands and get results)
+        subscriptions: dict,    # subscription container on main thread
         init_helper: (
             str | None
-        ) = None,  # initialization helper (if not specified, query everything from scratch)
+        ) = None,               # initialization helper (if not specified, query everything from scratch)
     ) -> None:
 
         # Logger should be set up first by subclass, but if not
@@ -148,11 +148,21 @@ class Block:
                 )
 
     def _register_subscription(
-        self, subscribe_type: str, channel: int | None = None
+        self,
+        subscribe_type: str,
+        channel: int | None = None,
+        rate_ms: int | None = None,
     ) -> TTPResponse:
         """
         Register subscription with the DSP. This function generates the subscription command
-        with the correct prefix IDs and metadata, such that responses will be directed back here
+        with the correct prefix IDs and metadata, such that responses will be directed back here.
+
+        Args:
+            subscribe_type: TTP subscription attribute name (e.g. "levels", "mutes").
+            channel:        Channel index for per-channel subscriptions, or None for all.
+            rate_ms:        Optional update rate in milliseconds.  Some block types (e.g.
+                            Parle BeamTracking) require an explicit rate in the subscribe
+                            command.  Leave as None for standard blocks.
 
         DO NOT CHANGE this without also double checking what's done in the main thread
         AS WELL AS TTPResponse, otherwise subscribed data might end up in the wrong place!
@@ -165,9 +175,10 @@ class Block:
         # Create subscription name
         sub_name = f"S_{subscribe_type}_{channel_id}_{self._block_id}"
 
-        # Create subscription string
+        # Create subscription string (with optional rate suffix for blocks that need it)
+        rate_suffix = f" {rate_ms}" if rate_ms is not None else ""
         sub_string = (
-            f'"{self._block_id}" subscribe {subscribe_type}{sub_channel} "{sub_name}"'
+            f'"{self._block_id}" subscribe {subscribe_type}{sub_channel} "{sub_name}"{rate_suffix}'
         )
 
         # Add that subscription to the main subscription list
@@ -176,11 +187,6 @@ class Block:
 
         # Send command to device to actually start subscription
         cmd_res = self._sync_command(sub_string)
-
-        # This is too chatty, TODO: figure out how to nicely put it in a separate logger
-        # self._logger.debug(
-        #     f"subscription setup: {self._block_id} {subscribe_type} (total {len(self._subscriptions)} subscriptions active)"
-        # )
 
         return cmd_res
 
