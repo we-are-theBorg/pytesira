@@ -1,24 +1,24 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-BFMic (Biamp Parlé Beamforming Microphone) DSP block.
+BFMic (Biamp Parle Beamforming Microphone) DSP block.
 
 Confirmed attributes via live probe on TesiraForteX (FW 5.6.1.2):
-  get numChannels         → int (2)
-  get audioSources {ch}  → [{azimuth: float, intensity: float}, ...] (4 beams)
-  get segmentsActive {ch} → [bool, bool, bool, bool] (4 zones)
-  get mute {ch}          → bool
-  set mute {ch} {true|false}
-  get level {ch}         → float (dB, range -100..+8)
-  set level {ch} {value}
-  get minLevel {ch}      → float (-100.0)
-  get maxLevel {ch}      → float (8.0)
-  label                  → NOT supported (auto-generated)
+  get numChannels          -> int (2) - two independent tracking channels
+  get audioSources {ch}   -> [{azimuth: float, intensity: float}, ...] (4 beams per channel)
+  get segmentsActive {ch} -> [bool, bool, bool, bool] (4 zone segments per channel)
+  get lobeData {ch}       -> [{azimuth, intensity, elevation}, ...] (firmware 4.11.2+)
+  get mute {ch}           -> bool / set mute {ch} {true|false}
+  get level {ch}          -> float (dB -100..+8) / set level {ch} {value}
+  get minLevel {ch}       -> float / get maxLevel {ch} -> float
+  label                   -> NOT supported (auto-generated)
 
-Subscriptions use an explicit rate parameter (300 ms default).
-BFMic sends the first subscription notification before +OK, so
-_sync_command will timeout on subscribe commands — this is handled
-by catching and ignoring the exception after adding to routing table.
+Channels 1..numChannels each have independent beamforming tracking. Each
+channel is typically configured in Biamp DSP designer to cover a separate
+spatial zone (e.g., channel 1 = table side, channel 2 = presenter side).
+
+Subscriptions fire before +OK (early-fire); timeout is expected and handled.
 """
+
 from threading import Event
 from queue import Queue
 from pytesira.block.block import Block
@@ -34,23 +34,20 @@ ACTIVE_THRESHOLD = 0.5
 def _safe_float(val, default: float = 0.0) -> float:
     """Convert val to float, stripping any trailing TTP dict braces."""
     try:
-        return float(str(val).strip().rstrip('}').strip())
+        return float(str(val).strip().rstrip("}").strip())
     except (ValueError, TypeError):
         return default
 
 
 class BFMic(Block):
     """
-    Biamp Parlé Beamforming Microphone — TTP block type 'BFMic'.
+    Biamp Parle Beamforming Microphone -- TTP block type BFMic.
 
-    Exposes:
-    - Per-channel mute and level control (2 channels)
-    - Real-time beam azimuth/intensity tracking via audioSources subscription
-    - Zone segment state via segmentsActive subscription
-    - Per-beam elevation from lobeData query (FW 4.11.2+)
+    Two independent beamforming channels (numChannels=2), each tracking
+    talkers in a separate spatial zone.
     """
 
-    VERSION = "0.1.1"
+    VERSION = "0.2.0"
 
     def __init__(
         self,
@@ -61,23 +58,15 @@ class BFMic(Block):
         subscriptions: dict,
         init_helper: str | None = None,
     ) -> None:
-
-        # Logger must be set before super().__init__
         self._logger = logging.getLogger(f"{__name__}.{block_id}")
-
         super().__init__(
-            block_id,
-            exit_flag,
-            connected_flag,
-            command_queue,
-            subscriptions,
-            init_helper,
+            block_id, exit_flag, connected_flag, command_queue, subscriptions, init_helper,
         )
 
-        # Beam tracking data — updated by audioSources subscription
-        self.beams: list[dict] = []
-        self.segments_active: list = []
-        self.elevations: list[float] = []
+        # Per-channel beamtracking data -- keyed by channel index (1-based)
+        self.channel_beams: dict[int, list[dict]] = {}
+        self.channel_segments_active: dict[int, list] = {}
+        self.channel_elevations: dict[int, list[float]] = {}
 
         try:
             if init_helper is not None:
@@ -120,22 +109,23 @@ class BFMic(Block):
 
     def _subscribe_beamtracking(self) -> list[TTPResponse]:
         results = []
-        for sub_type in ("audioSources", "segmentsActive"):
-            try:
-                r = self._register_subscription(
-                    subscribe_type=sub_type,
-                    channel=1,
-                    rate_ms=_DEFAULT_RATE_MS,
-                )
-                results.append(r)
-            except Exception as exc:
-                self._logger.debug(
-                    f"{sub_type} subscribe timed out (normal for BFMic): {exc}"
-                )
+        for ch_idx in range(1, len(self.channels) + 1):
+            for sub_type in ("audioSources", "segmentsActive"):
+                try:
+                    r = self._register_subscription(
+                        subscribe_type=sub_type,
+                        channel=ch_idx,
+                        rate_ms=_DEFAULT_RATE_MS,
+                    )
+                    results.append(r)
+                except Exception as exc:
+                    self._logger.debug(
+                        f"{sub_type} ch{ch_idx} subscribe timed out (normal for BFMic): {exc}"
+                    )
         return results
 
     # ------------------------------------------------------------------
-    # Subscription callback — wrapped in try/except to protect rx_loop
+    # Subscription callback
     # ------------------------------------------------------------------
 
     def subscription_callback(self, response: TTPResponse) -> None:
@@ -157,18 +147,28 @@ class BFMic(Block):
                         self.channels[idx]._level(_safe_float(level))
 
             elif sub_type == "audioSources":
-                self._handle_audio_sources(response.value)
+                try:
+                    ch = int(response.subscription_channel_id)
+                except (ValueError, AttributeError):
+                    ch = 1
+                self._handle_audio_sources(ch, response.value)
 
             elif sub_type == "segmentsActive":
+                try:
+                    ch = int(response.subscription_channel_id)
+                except (ValueError, AttributeError):
+                    ch = 1
                 val = response.value
-                self.segments_active = val if isinstance(val, list) else [val]
+                self.channel_segments_active[ch] = val if isinstance(val, list) else [val]
 
         except Exception as exc:
-            self._logger.warning(f"subscription_callback error ({response.subscription_type}): {exc}")
+            self._logger.warning(
+                f"subscription_callback error ({response.subscription_type}): {exc}"
+            )
 
         super().subscription_callback(response)
 
-    def _handle_audio_sources(self, value) -> None:
+    def _handle_audio_sources(self, channel: int, value) -> None:
         items = value if isinstance(value, list) else [value]
         beams = []
         for item in items:
@@ -180,7 +180,7 @@ class BFMic(Block):
                     })
             except Exception as exc:
                 self._logger.debug(f"beam parse error: {exc!r} item={item!r}")
-        self.beams = beams
+        self.channel_beams[channel] = beams
 
     # ------------------------------------------------------------------
     # Channel change callbacks
@@ -246,54 +246,92 @@ class BFMic(Block):
             )
 
     def _query_lobe_data(self) -> None:
-        try:
-            resp = self._sync_command(f'"{self._block_id}" get lobeData')
-            if resp.type == TTPResponseType.CMD_OK_VALUE and isinstance(resp.value, list):
-                self.elevations = [
-                    _safe_float(item.get("elevation", 0)) if isinstance(item, dict) else 0.0
-                    for item in resp.value
-                ]
-        except Exception:
-            pass
+        for ch in range(1, len(self.channels) + 1):
+            try:
+                resp = self._sync_command(f'"{self._block_id}" get lobeData {ch}')
+                if resp.type == TTPResponseType.CMD_OK_VALUE and isinstance(resp.value, list):
+                    self.channel_elevations[ch] = [
+                        _safe_float(item.get("elevation", 0)) if isinstance(item, dict) else 0.0
+                        for item in resp.value
+                    ]
+            except Exception:
+                pass
 
     def export_init_helper(self) -> dict:
         return {"version": self.VERSION, "helper": self._init_helper}
 
     # ------------------------------------------------------------------
-    # Computed properties
+    # Per-channel computed methods
+    # ------------------------------------------------------------------
+
+    def beams_for_channel(self, ch: int) -> list[dict]:
+        return self.channel_beams.get(ch, [])
+
+    def active_beams_for_channel(self, ch: int) -> list[dict]:
+        return [b for b in self.beams_for_channel(ch) if b["intensity"] >= ACTIVE_THRESHOLD]
+
+    def talker_count_for_channel(self, ch: int) -> int:
+        return len(self.active_beams_for_channel(ch))
+
+    def primary_beam_for_channel(self, ch: int) -> dict | None:
+        active = self.active_beams_for_channel(ch)
+        return max(active, key=lambda b: b["intensity"]) if active else None
+
+    def primary_azimuth_for_channel(self, ch: int) -> float | None:
+        b = self.primary_beam_for_channel(ch)
+        return b["azimuth"] if b else None
+
+    def primary_intensity_for_channel(self, ch: int) -> float | None:
+        b = self.primary_beam_for_channel(ch)
+        return b["intensity"] if b else None
+
+    def primary_elevation_for_channel(self, ch: int) -> float | None:
+        elevs = self.channel_elevations.get(ch, [])
+        beams = self.beams_for_channel(ch)
+        primary = self.primary_beam_for_channel(ch)
+        if not elevs or not beams or primary is None:
+            return None
+        try:
+            return elevs[beams.index(primary)]
+        except (ValueError, IndexError):
+            return None
+
+    # ------------------------------------------------------------------
+    # Backward-compatible block-level properties (alias to channel 1)
     # ------------------------------------------------------------------
 
     @property
+    def beams(self) -> list[dict]:
+        return self.channel_beams.get(1, [])
+
+    @property
+    def segments_active(self) -> list:
+        return self.channel_segments_active.get(1, [])
+
+    @property
+    def elevations(self) -> list[float]:
+        return self.channel_elevations.get(1, [])
+
+    @property
     def active_beams(self) -> list[dict]:
-        return [b for b in self.beams if b["intensity"] >= ACTIVE_THRESHOLD]
+        return self.active_beams_for_channel(1)
 
     @property
     def talker_count(self) -> int:
-        return len(self.active_beams)
+        return self.talker_count_for_channel(1)
 
     @property
     def primary_beam(self) -> dict | None:
-        active = self.active_beams
-        return max(active, key=lambda b: b["intensity"]) if active else None
+        return self.primary_beam_for_channel(1)
 
     @property
     def primary_azimuth(self) -> float | None:
-        b = self.primary_beam
-        return b["azimuth"] if b else None
+        return self.primary_azimuth_for_channel(1)
 
     @property
     def primary_intensity(self) -> float | None:
-        b = self.primary_beam
-        return b["intensity"] if b else None
+        return self.primary_intensity_for_channel(1)
 
     @property
     def primary_elevation(self) -> float | None:
-        if not self.elevations or not self.beams:
-            return None
-        primary = self.primary_beam
-        if primary is None:
-            return None
-        try:
-            return self.elevations[self.beams.index(primary)]
-        except (ValueError, IndexError):
-            return None
+        return self.primary_elevation_for_channel(1)
