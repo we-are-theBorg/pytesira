@@ -478,7 +478,15 @@ class DSP:
                     )
 
             except Exception as e:
-                self._logger.warning(f"command loop exception: {e}")
+                self.__logger.warning(f"command loop exception: {e}") 
+                try:
+                    err = TTPResponse(f"-ERR {e}")
+                    if handle == self:
+                        self.__sync_cmd_mailbox = err
+                    else:
+                        handle._sync_command_callback(data=err)
+                except Exception:
+                    pass
 
             # Notify queue of a completed task
             self.__command_queue.task_done()
