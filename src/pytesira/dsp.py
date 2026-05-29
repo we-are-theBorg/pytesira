@@ -562,11 +562,16 @@ class DSP:
 
                 # Data update query
                 if refresh_task_item["type"] == "query":
-                    setattr(
-                        self,
-                        refresh_task_item["attribute"],
-                        self.__sync_command(refresh_task_item["command"]).value,
-                    )
+                    try:
+                        setattr(
+                            self,
+                            refresh_task_item["attribute"],
+                            self.__sync_command(refresh_task_item["command"]).value,
+                        )
+                    except Exception as _e:
+                        self.__logger.debug(
+                            f"refresh query failed ({refresh_task_item['command']}): {_e}"
+                        )
 
                 # Subscription refresh
                 elif refresh_task_item["type"] == "subscription_refresh":
@@ -589,9 +594,13 @@ class DSP:
 
                     # Refresh this?
                     if process_this_refresh:
-                        sub_refresh_statuses = refresh_task_item[
-                            "block"
-                        ]._register_base_subscriptions()
+                        try:
+                            sub_refresh_statuses = refresh_task_item[
+                                "block"
+                            ]._register_base_subscriptions()
+                        except Exception as _e:
+                            self.__logger.debug(f"subscription refresh failed: {_e}")
+                            sub_refresh_statuses = []
 
                     # Using result to check?
                     if (
